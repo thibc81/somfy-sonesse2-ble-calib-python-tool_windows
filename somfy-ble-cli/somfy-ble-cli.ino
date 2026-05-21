@@ -591,111 +591,253 @@ bool pollFileStatus(int maxAttempts) {
 // Read sequence:  OPEN(read) -> poll status -> SIZE -> read response -> READ -> read response -> CLOSE
 // Write sequence: OPEN(write) -> WRITE(cbor) -> CLOSE -> poll status
 
-bool configFileRead(uint8_t fhi, uint8_t flo, uint8_t* buf, int* outLen) {
-  *outLen = 0;
-
-  // Step 1: OPEN_FILE in READ mode: [00 fhi flo 00]
-  uint8_t openCmd[4] = { WDATA_OPEN, fhi, flo, FMODE_READ };
-  if (!bleWriteFlexible(UUID_WRITEDATA, openCmd, 4)) {
-    printERR("Failed to open config file");
-    return false;
+// Find a characteristic once, avoiding repeated service iteration
+BLERemoteCharacteristic* findChar(BLEUUID uuid) {
+  if (!connected || !pClient) return nullptr;
+  std::map<std::string, BLERemoteService*>* services = pClient->getServices();
+  for (auto& kv : *services) {
+    try {
+      BLERemoteCharacteristic* c = kv.second->getCharacteristic(uuid);
+      if (c) return c;
+    } catch (...) {}
   }
-
-  // Step 2: Poll FileStatus until ready
-  if (!pollFileStatus(10)) {
-    printWARN("FileStatus not ready, continuing anyway...");
-  }
-
-  // Step 3: SIZE command: just [01]
-  uint8_t sizeCmd[1] = { WDATA_SIZE };
-  if (!bleWriteFlexible(UUID_WRITEDATA, sizeCmd, 1)) {
-    printERR("Failed to send SIZE command");
-    goto cleanup;
-  }
-  delay(200);
-
-  // Read size response from 00040001
-  {
-    uint8_t sizeBuf[4];
-    int sizeLen = bleReadTo(UUID_WRITEDATA, sizeBuf, sizeof(sizeBuf));
-    if (sizeLen >= 2) {
-      uint16_t fileSize = sizeBuf[0] | ((uint16_t)sizeBuf[1] << 8);
-      char msg[40];
-      snprintf(msg, sizeof(msg), "File size: %u bytes", fileSize);
-      printInfo(msg);
-    }
-  }
-
-  // Step 4: READ command: just [03]
-  {
-    uint8_t readCmd[1] = { WDATA_READ };
-    if (!bleWriteFlexible(UUID_WRITEDATA, readCmd, 1)) {
-      printERR("Failed to send READ command");
-      goto cleanup;
-    }
-    delay(200);
-  }
-
-  // Step 5: Read data response from 00040001
-  *outLen = bleReadTo(UUID_WRITEDATA, buf, CFG_BUF_SIZE);
-
-cleanup:
-  // Step 6: CLOSE_FILE: just [04]
-  {
-    uint8_t closeCmd[1] = { WDATA_CLOSE };
-    bleWriteFlexible(UUID_WRITEDATA, closeCmd, 1);
-  }
-
-  return *outLen > 0;
+  return nullptr;
 }
 
-bool configFileWrite(uint8_t fhi, uint8_t flo, uint8_t* data, int dataLen) {
-  // Step 1: OPEN_FILE in WRITE mode: [00 fhi flo 01]
-  uint8_t openCmd[4] = { WDATA_OPEN, fhi, flo, FMODE_WRITE };
-  if (!bleWriteFlexible(UUID_WRITEDATA, openCmd, 4)) {
-    printERR("Failed to open config file for writing");
-    return false;
-  }
-  delay(200);
+// ─── Async Config File State Machine ─────────────────────────────
+// The ESP32 BLE stack requires returning to loop() between write and read
+// operations on the same characteristic. Manual CLI commands work because
+// each command is a separate loop() iteration. We replicate that here.
 
-  // Step 2: WRITE command: [02] + CBOR data (no file ID!)
-  uint8_t writeBuf[CFG_BUF_SIZE];
-  writeBuf[0] = WDATA_WRITE;
-  if (dataLen + 1 > CFG_BUF_SIZE) {
-    printERR("Data too large");
-    goto fail;
-  }
-  memcpy(writeBuf + 1, data, dataLen);
-  if (!bleWriteFlexible(UUID_WRITEDATA, writeBuf, dataLen + 1)) {
-    printERR("Failed to write config data");
-    goto fail;
-  }
-  delay(200);
+enum CfgState {
+  CFG_IDLE,
+  CFG_OPEN_SENT,      // OPEN written, waiting for next loop
+  CFG_READ_SENT,      // READ written, waiting for next loop
+  CFG_FETCH,           // Ready to read data
+  CFG_CLOSE,           // Send CLOSE
+  CFG_DONE,            // Display results
+  CFG_WRITE_OPEN_SENT, // Write flow: OPEN sent
+  CFG_WRITE_DATA_SENT, // Write flow: data sent
+  CFG_WRITE_CLOSE_SENT // Write flow: CLOSE sent, poll status
+};
 
-  // Step 3: CLOSE_FILE: just [04]
-  {
-    uint8_t closeCmd[1] = { WDATA_CLOSE };
-    if (!bleWriteFlexible(UUID_WRITEDATA, closeCmd, 1)) {
-      printERR("Failed to close config file");
-      return false;
+CfgState cfgState = CFG_IDLE;
+uint8_t cfgFileHi = 0, cfgFileLo = 0;
+String cfgFileName = "";
+unsigned long cfgStepTime = 0;
+#define CFG_STEP_DELAY 500  // ms between state machine steps
+
+void cfgStateMachine() {
+  if (cfgState == CFG_IDLE) return;
+  if (millis() - cfgStepTime < CFG_STEP_DELAY) return;
+
+  switch (cfgState) {
+    case CFG_OPEN_SENT: {
+      // Send READ command with file ID (this motor wants file IDs)
+      uint8_t readCmd[3] = { WDATA_READ, cfgFileLo, cfgFileHi };
+      printInfo("READ...");
+      if (!bleWriteFlexible(UUID_WRITEDATA, readCmd, 3)) {
+        printERR("READ cmd failed");
+        cfgState = CFG_CLOSE;
+      } else {
+        cfgState = CFG_FETCH;
+      }
+      cfgStepTime = millis();
+      break;
     }
+    case CFG_FETCH: {
+      printInfo("Fetching data...");
+      cfgBufLen = bleReadTo(UUID_WRITEDATA, cfgBuf, CFG_BUF_SIZE);
+      if (cfgBufLen == 0) {
+        // One retry on next loop
+        cfgState = CFG_CLOSE;
+        printERR("Read returned 0 bytes");
+      } else {
+        cfgState = CFG_CLOSE;
+      }
+      cfgStepTime = millis();
+      break;
+    }
+    case CFG_CLOSE: {
+      uint8_t closeCmd[3] = { WDATA_CLOSE, cfgFileLo, cfgFileHi };
+      bleWriteFlexible(UUID_WRITEDATA, closeCmd, 3);
+      cfgState = CFG_DONE;
+      cfgStepTime = millis();
+      break;
+    }
+    case CFG_DONE: {
+      if (cfgBufLen > 0) {
+        char msg[48];
+        snprintf(msg, sizeof(msg), "Got %d bytes, decoding CBOR:", cfgBufLen);
+        printOK(msg);
+        Serial.println("  ┌─────────────────────────────────────────────");
+        int pos = 0;
+        cborIndent = 1;
+        cborPrintValue(cfgBuf, &pos, cfgBufLen, true);
+        if (pos < cfgBufLen) {
+          Serial.print("  │ (");
+          Serial.print(cfgBufLen - pos);
+          Serial.println(" bytes remaining, possibly truncated by BLE MTU)");
+        }
+        Serial.println("  └─────────────────────────────────────────────");
+      }
+      cfgState = CFG_IDLE;
+      Serial.print("somfy> ");
+      break;
+    }
+    case CFG_WRITE_OPEN_SENT: {
+      // Write the CBOR data: [02] + payload (no file ID per app protocol)
+      uint8_t writeBuf[CFG_BUF_SIZE];
+      writeBuf[0] = WDATA_WRITE;
+      memcpy(writeBuf + 1, cfgBuf, cfgBufLen);
+      printInfo("Writing CBOR data...");
+      if (!bleWriteFlexible(UUID_WRITEDATA, writeBuf, cfgBufLen + 1)) {
+        printERR("Write data failed");
+        cfgState = CFG_CLOSE;
+      } else {
+        cfgState = CFG_WRITE_DATA_SENT;
+      }
+      cfgStepTime = millis();
+      break;
+    }
+    case CFG_WRITE_DATA_SENT: {
+      // Send CLOSE
+      uint8_t closeCmd[1] = { WDATA_CLOSE };
+      printInfo("Closing file...");
+      bleWriteFlexible(UUID_WRITEDATA, closeCmd, 1);
+      cfgState = CFG_WRITE_CLOSE_SENT;
+      cfgStepTime = millis();
+      break;
+    }
+    case CFG_WRITE_CLOSE_SENT: {
+      // Poll FileStatus
+      printInfo("Checking status...");
+      if (pollFileStatus(5)) {
+        printOK("Config written! Power-cycle motor for changes to take effect.");
+      } else {
+        printWARN("FileStatus did not confirm (may still have worked).");
+      }
+      cfgBufLen = 0;
+      cfgState = CFG_IDLE;
+      Serial.print("somfy> ");
+      break;
+    }
+    default:
+      cfgState = CFG_IDLE;
+      break;
+  }
+}
+
+// ─── Command Queue (macro system) ────────────────────────────────
+// Queues commands to be executed as if typed, one per loop() iteration.
+// This guarantees the same code path as manual CLI commands.
+
+#define CMD_QUEUE_SIZE 8
+#define CMD_QUEUE_LEN 80
+#define CMD_QUEUE_DELAY_MS 1800
+char cmdQueue[CMD_QUEUE_SIZE][CMD_QUEUE_LEN];
+int cmdQueueHead = 0;
+int cmdQueueTail = 0;
+bool cmdQueueCbor = false;  // If true, decode cfgBuf as CBOR after queue drains
+unsigned long cmdQueueNextAt = 0;
+
+void cmdQueuePush(const char* cmd) {
+  int next = (cmdQueueTail + 1) % CMD_QUEUE_SIZE;
+  if (next == cmdQueueHead) return; // full
+  bool wasEmpty = cmdQueueEmpty();
+  strncpy(cmdQueue[cmdQueueTail], cmd, CMD_QUEUE_LEN - 1);
+  cmdQueue[cmdQueueTail][CMD_QUEUE_LEN - 1] = '\0';
+  cmdQueueTail = next;
+  if (wasEmpty) cmdQueueNextAt = millis();
+}
+
+bool cmdQueueEmpty() { return cmdQueueHead == cmdQueueTail; }
+
+// Called from loop() - executes one queued command per iteration
+void cmdQueueTick() {
+  if (cmdQueueHead == cmdQueueTail) return;
+  if (millis() < cmdQueueNextAt) return;
+
+  char* cmd = cmdQueue[cmdQueueHead];
+  cmdQueueHead = (cmdQueueHead + 1) % CMD_QUEUE_SIZE;
+  cmdQueueNextAt = millis() + CMD_QUEUE_DELAY_MS;
+
+  // Special command: "__read_to_cfgbuf" reads 00040001 into cfgBuf
+  if (strcmp(cmd, "__read_to_cfgbuf") == 0) {
+    printInfo("Fetching data...");
+    cfgBufLen = bleReadTo(UUID_WRITEDATA, cfgBuf, CFG_BUF_SIZE);
+    char msg[40]; snprintf(msg, sizeof(msg), "Got %d bytes", cfgBufLen);
+    printInfo(msg);
+    return;
   }
 
-  // Step 4: Poll FileStatus for success
-  printInfo("Waiting for motor to confirm write...");
-  if (pollFileStatus(10)) {
-    return true;
-  } else {
-    printWARN("FileStatus did not confirm success (may still have worked)");
-    return true;  // optimistic -- the write may have succeeded
+  // Special command: "__show_cbor" decodes cfgBuf
+  if (strcmp(cmd, "__show_cbor") == 0) {
+    if (cfgBufLen > 0) {
+      Serial.println("  ┌─────────────────────────────────────────────");
+      int pos = 0;
+      cborIndent = 1;
+      cborPrintValue(cfgBuf, &pos, cfgBufLen, true);
+      if (pos < cfgBufLen) {
+        Serial.print("  │ (");
+        Serial.print(cfgBufLen - pos);
+        Serial.println(" bytes remaining, truncated by BLE MTU)");
+      }
+      Serial.println("  └─────────────────────────────────────────────");
+    } else {
+      printERR("No data read");
+    }
+    return;
   }
 
-fail:
-  {
-    uint8_t closeCmd[1] = { WDATA_CLOSE };
-    bleWriteFlexible(UUID_WRITEDATA, closeCmd, 1);
+  // Normal command - echo and execute through the same path as manual typing
+  Serial.print("  >> ");
+  Serial.println(cmd);
+  processCommand(String(cmd));
+}
+
+// Start an async config file read
+void configFileReadAsync(const String& fileName) {
+  uint8_t fhi, flo;
+  if (!getFileId(fileName, &fhi, &flo)) {
+    printERR("Unknown file. Use: motor, radio, type, hmi");
+    return;
   }
-  return false;
+
+  char msg[48];
+  snprintf(msg, sizeof(msg), "Reading %s config (0x%02X%02X)...", fileName.c_str(), fhi, flo);
+  printInfo(msg);
+
+  // Queue the exact same commands that work when typed manually.
+  // File ID is little-endian on wire: "00C4" -> bytes C4 00 (flo fhi)
+  char cmd[CMD_QUEUE_LEN];
+  snprintf(cmd, sizeof(cmd), "write 00040001 00 %02X %02X 00", flo, fhi);
+  cmdQueuePush(cmd);
+  snprintf(cmd, sizeof(cmd), "write 00040001 03 %02X %02X", flo, fhi);
+  cmdQueuePush(cmd);
+  cmdQueuePush("__read_to_cfgbuf");
+  cmdQueuePush("__show_cbor");
+  snprintf(cmd, sizeof(cmd), "write 00040001 04 %02X %02X", flo, fhi);
+  cmdQueuePush(cmd);
+}
+
+// Start an async config file write (cfgBuf/cfgBufLen must be set with CBOR data)
+void configFileWriteAsync() {
+  if (cfgState != CFG_IDLE) {
+    printERR("Config operation already in progress");
+    return;
+  }
+
+  // Send OPEN for writing
+  // File ID is little-endian on wire: lo byte first
+  uint8_t openCmd[4] = { WDATA_OPEN, cfgFileLo, cfgFileHi, FMODE_WRITE };
+  printInfo("Opening for write...");
+  if (!bleWriteFlexible(UUID_WRITEDATA, openCmd, 4)) {
+    printERR("OPEN failed");
+    return;
+  }
+  cfgState = CFG_WRITE_OPEN_SENT;
+  cfgStepTime = millis();
 }
 
 // ─── Config Commands ─────────────────────────────────────────────
@@ -724,68 +866,19 @@ void cmdConfigList() {
 }
 
 void cmdConfigRead(const String& fileName) {
-  uint8_t fhi, flo;
-  if (!getFileId(fileName, &fhi, &flo)) {
-    printERR("Unknown file. Use: motor, radio, type, hmi");
-    return;
-  }
-
-  char msg[48];
-  snprintf(msg, sizeof(msg), "Reading %s config (0x%02X%02X)...", fileName.c_str(), fhi, flo);
-  printInfo(msg);
-
-  if (!configFileRead(fhi, flo, cfgBuf, &cfgBufLen)) {
-    printERR("Failed to read config file (empty or unreadable)");
-    return;
-  }
-
-  snprintf(msg, sizeof(msg), "Got %d bytes, decoding CBOR:", cfgBufLen);
-  printOK(msg);
-  Serial.println("  ┌─────────────────────────────────────────────");
-
-  int pos = 0;
-  cborIndent = 1;
-  cborPrintValue(cfgBuf, &pos, cfgBufLen, true);
-
-  if (pos < cfgBufLen) {
-    Serial.print("  │ (");
-    Serial.print(cfgBufLen - pos);
-    Serial.println(" bytes remaining, possibly truncated by BLE MTU)");
-  }
-  Serial.println("  └─────────────────────────────────────────────");
+  configFileReadAsync(fileName);
+  // Results displayed by cfgStateMachine() in loop()
 }
 
 void cmdConfigDump(const String& fileName) {
-  uint8_t fhi, flo;
-  if (!getFileId(fileName, &fhi, &flo)) {
-    printERR("Unknown file. Use: motor, radio, type, hmi");
-    return;
-  }
-
-  char msg[48];
-  snprintf(msg, sizeof(msg), "Dumping %s config (0x%02X%02X)...", fileName.c_str(), fhi, flo);
-  printInfo(msg);
-
-  if (!configFileRead(fhi, flo, cfgBuf, &cfgBufLen)) {
-    printERR("Failed to read config file");
-    return;
-  }
-
-  snprintf(msg, sizeof(msg), "%d bytes:", cfgBufLen);
-  printOK(msg);
-
-  // Print hex dump with offset
-  for (int i = 0; i < cfgBufLen; i += 16) {
-    char offset[8];
-    snprintf(offset, sizeof(offset), "  %04X: ", i);
-    Serial.print(offset);
-    for (int j = 0; j < 16 && i + j < cfgBufLen; j++) {
-      char hex[4];
-      snprintf(hex, sizeof(hex), "%02X ", cfgBuf[i + j]);
-      Serial.print(hex);
-    }
-    Serial.println();
-  }
+  // Reuse the async read, but dump will be handled in DONE state
+  // For now, use read -- the CBOR output shows the decoded version,
+  // dump can be done with: write 00040001 00 C4 00 00 / write 00040001 03 C4 00 / read 00040001
+  printInfo("Use 'config read' for decoded view, or manual commands for hex dump:");
+  Serial.println("  write 00040001 00 <fhi> <flo> 00");
+  Serial.println("  write 00040001 03 <fhi> <flo>");
+  Serial.println("  read 00040001");
+  Serial.println("  write 00040001 04 <fhi> <flo>");
 }
 
 void cmdConfigSet(const String& args) {
@@ -909,14 +1002,12 @@ void cmdConfigSetConfirm() {
     return;
   }
   // Retrieve file ID from after CBOR data
-  uint8_t fhi = cfgBuf[cfgBufLen];
-  uint8_t flo = cfgBuf[cfgBufLen + 1];
+  cfgFileHi = cfgBuf[cfgBufLen];
+  cfgFileLo = cfgBuf[cfgBufLen + 1];
 
-  printInfo("Writing config...");
-  if (configFileWrite(fhi, flo, cfgBuf, cfgBufLen)) {
-    printOK("Config written! Power-cycle the motor for changes to take effect.");
-  }
-  cfgBufLen = 0;
+  // cfgBuf already has the CBOR, cfgBufLen is the CBOR length
+  configFileWriteAsync();
+  // Results displayed by cfgStateMachine() in loop()
 }
 
 // ─── Info Command ────────────────────────────────────────────────
@@ -1669,7 +1760,8 @@ void loop() {
         historyPos = -1;
         savedInput = "";
       }
-      Serial.print("somfy> ");
+      // Don't print prompt if an async config operation is running.
+      if (cfgState == CFG_IDLE && cmdQueueEmpty()) Serial.print("somfy> ");
     } else if (c == 127 || c == 8) {
       // Backspace
       if (inputBuffer.length() > 0) {
@@ -1690,8 +1782,22 @@ void loop() {
       Serial.print(c);
     }
   }
+  // Run async config operations (one queued command per loop iteration)
+  cfgStateMachine();
+  if (cmdQueueEmpty()) {
+    // nothing
+  } else {
+    cmdQueueTick();
+    if (!cmdQueueEmpty()) {
+      // More commands pending - skip prompt
+    } else {
+      Serial.print("somfy> ");
+    }
+  }
+
   if (connected && !pClient->isConnected()) {
     connected = false; authenticated = false; pService = nullptr;
+    cfgState = CFG_IDLE;
     Serial.println(); printWARN("BLE connection lost!"); Serial.print("somfy> ");
   }
   delay(10);
