@@ -1,3 +1,8 @@
+# APK decompilation work
+apk-work/
+*.apk
+*.xapk
+
 # Arduino build artifacts
 build/
 *.elf

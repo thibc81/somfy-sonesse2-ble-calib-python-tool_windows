@@ -76,7 +76,8 @@ static BLEUUID UUID_LEAVE_NET   ("00020001-cad9-46c6-a2ea-2ca16d57b4a5"); // ★
 #define FMODE_READ   0x00
 #define FMODE_WRITE  0x01
 
-static BLEUUID UUID_WRITEDATA ("00040001-cad9-46c6-a2ea-2ca16d57b4a5");
+static BLEUUID UUID_WRITEDATA  ("00040001-cad9-46c6-a2ea-2ca16d57b4a5");
+static BLEUUID UUID_FILESTATUS ("00040003-cad9-46c6-a2ea-2ca16d57b4a5");
 
 // ─── State ───────────────────────────────────────────────────────
 
@@ -244,6 +245,28 @@ bool bleWriteFlexible(BLEUUID uuid, uint8_t* data, size_t len) {
       printERR("Write failed");
       return false;
     }
+  }
+}
+
+// Write without response -- needed for WriteData protocol where write-with-response
+// consumes the read buffer (the BLE response read eats the queued config data).
+bool bleWriteNoResp(BLEUUID uuid, uint8_t* data, size_t len) {
+  if (!connected) { printERR("Not connected"); return false; }
+  BLERemoteCharacteristic* pChar = nullptr;
+  std::map<std::string, BLERemoteService*>* services = pClient->getServices();
+  for (auto& kv : *services) {
+    try {
+      pChar = kv.second->getCharacteristic(uuid);
+      if (pChar != nullptr) break;
+    } catch (...) { continue; }
+  }
+  if (pChar == nullptr) { printERR("Characteristic not found"); return false; }
+  try {
+    pChar->writeValue(data, len, false);
+    return true;
+  } catch (...) {
+    printERR("Write failed");
+    return false;
   }
 }
 
@@ -542,66 +565,137 @@ bool getFileId(const String& name, uint8_t* hi, uint8_t* lo) {
   return false;
 }
 
+// Poll FileStatus (00040003) for success. Returns true if 0500 or 0564 seen.
+bool pollFileStatus(int maxAttempts) {
+  uint8_t st[4];
+  for (int i = 0; i < maxAttempts; i++) {
+    int len = bleReadTo(UUID_FILESTATUS, st, sizeof(st));
+    if (len >= 2) {
+      // Success codes from TaHoma Pro app: "0500" or "0564"
+      if (st[0] == 0x05 && (st[1] == 0x00 || st[1] == 0x64)) {
+        return true;
+      }
+    }
+    delay(500);
+  }
+  return false;
+}
+
+// Protocol derived from decompiling TaHoma Pro 2.4.0:
+//   OPEN_FILE:  [00] [fileId_hi] [fileId_lo] [mode]  (fileId is little-endian on wire)
+//   SIZE:       [01]                                  (no fileId, no mode)
+//   WRITE:      [02] [cbor_bytes...]                  (no fileId!)
+//   READ:       [03]                                  (no fileId!)
+//   CLOSE_FILE: [04]                                  (no fileId!)
+//
+// Read sequence:  OPEN(read) -> poll status -> SIZE -> read response -> READ -> read response -> CLOSE
+// Write sequence: OPEN(write) -> WRITE(cbor) -> CLOSE -> poll status
+
 bool configFileRead(uint8_t fhi, uint8_t flo, uint8_t* buf, int* outLen) {
-  // Open file for reading
+  *outLen = 0;
+
+  // Step 1: OPEN_FILE in READ mode: [00 fhi flo 00]
   uint8_t openCmd[4] = { WDATA_OPEN, fhi, flo, FMODE_READ };
   if (!bleWriteFlexible(UUID_WRITEDATA, openCmd, 4)) {
     printERR("Failed to open config file");
     return false;
   }
-  delay(50);
 
-  // Send read command
-  uint8_t readCmd[3] = { WDATA_READ, fhi, flo };
-  if (!bleWriteFlexible(UUID_WRITEDATA, readCmd, 3)) {
-    printERR("Failed to send read command");
-    return false;
+  // Step 2: Poll FileStatus until ready
+  if (!pollFileStatus(10)) {
+    printWARN("FileStatus not ready, continuing anyway...");
   }
-  delay(100);
 
-  // Read the data back
+  // Step 3: SIZE command: just [01]
+  uint8_t sizeCmd[1] = { WDATA_SIZE };
+  if (!bleWriteFlexible(UUID_WRITEDATA, sizeCmd, 1)) {
+    printERR("Failed to send SIZE command");
+    goto cleanup;
+  }
+  delay(200);
+
+  // Read size response from 00040001
+  {
+    uint8_t sizeBuf[4];
+    int sizeLen = bleReadTo(UUID_WRITEDATA, sizeBuf, sizeof(sizeBuf));
+    if (sizeLen >= 2) {
+      uint16_t fileSize = sizeBuf[0] | ((uint16_t)sizeBuf[1] << 8);
+      char msg[40];
+      snprintf(msg, sizeof(msg), "File size: %u bytes", fileSize);
+      printInfo(msg);
+    }
+  }
+
+  // Step 4: READ command: just [03]
+  {
+    uint8_t readCmd[1] = { WDATA_READ };
+    if (!bleWriteFlexible(UUID_WRITEDATA, readCmd, 1)) {
+      printERR("Failed to send READ command");
+      goto cleanup;
+    }
+    delay(200);
+  }
+
+  // Step 5: Read data response from 00040001
   *outLen = bleReadTo(UUID_WRITEDATA, buf, CFG_BUF_SIZE);
 
-  // Close file
-  uint8_t closeCmd[3] = { WDATA_CLOSE, fhi, flo };
-  bleWriteFlexible(UUID_WRITEDATA, closeCmd, 3);
+cleanup:
+  // Step 6: CLOSE_FILE: just [04]
+  {
+    uint8_t closeCmd[1] = { WDATA_CLOSE };
+    bleWriteFlexible(UUID_WRITEDATA, closeCmd, 1);
+  }
 
   return *outLen > 0;
 }
 
 bool configFileWrite(uint8_t fhi, uint8_t flo, uint8_t* data, int dataLen) {
-  // Open file for writing
+  // Step 1: OPEN_FILE in WRITE mode: [00 fhi flo 01]
   uint8_t openCmd[4] = { WDATA_OPEN, fhi, flo, FMODE_WRITE };
   if (!bleWriteFlexible(UUID_WRITEDATA, openCmd, 4)) {
     printERR("Failed to open config file for writing");
     return false;
   }
-  delay(50);
+  delay(200);
 
-  // Write data (prepend write command + file id)
+  // Step 2: WRITE command: [02] + CBOR data (no file ID!)
   uint8_t writeBuf[CFG_BUF_SIZE];
   writeBuf[0] = WDATA_WRITE;
-  writeBuf[1] = fhi;
-  writeBuf[2] = flo;
-  if (dataLen + 3 > CFG_BUF_SIZE) {
+  if (dataLen + 1 > CFG_BUF_SIZE) {
     printERR("Data too large");
-    return false;
+    goto fail;
   }
-  memcpy(writeBuf + 3, data, dataLen);
-  if (!bleWriteFlexible(UUID_WRITEDATA, writeBuf, dataLen + 3)) {
+  memcpy(writeBuf + 1, data, dataLen);
+  if (!bleWriteFlexible(UUID_WRITEDATA, writeBuf, dataLen + 1)) {
     printERR("Failed to write config data");
-    // Still try to close
-    uint8_t closeCmd[3] = { WDATA_CLOSE, fhi, flo };
-    bleWriteFlexible(UUID_WRITEDATA, closeCmd, 3);
-    return false;
+    goto fail;
   }
-  delay(50);
+  delay(200);
 
-  // Close file
-  uint8_t closeCmd[3] = { WDATA_CLOSE, fhi, flo };
-  bleWriteFlexible(UUID_WRITEDATA, closeCmd, 3);
+  // Step 3: CLOSE_FILE: just [04]
+  {
+    uint8_t closeCmd[1] = { WDATA_CLOSE };
+    if (!bleWriteFlexible(UUID_WRITEDATA, closeCmd, 1)) {
+      printERR("Failed to close config file");
+      return false;
+    }
+  }
 
-  return true;
+  // Step 4: Poll FileStatus for success
+  printInfo("Waiting for motor to confirm write...");
+  if (pollFileStatus(10)) {
+    return true;
+  } else {
+    printWARN("FileStatus did not confirm success (may still have worked)");
+    return true;  // optimistic -- the write may have succeeded
+  }
+
+fail:
+  {
+    uint8_t closeCmd[1] = { WDATA_CLOSE };
+    bleWriteFlexible(UUID_WRITEDATA, closeCmd, 1);
+  }
+  return false;
 }
 
 // ─── Config Commands ─────────────────────────────────────────────
@@ -719,7 +813,8 @@ void cmdConfigSet(const String& args) {
     return;
   }
 
-  // Build CBOR: map(1) { key: value }
+  // Build CBOR: map(1) { key: [value] }
+  // TaHoma Pro wraps values in a 1-element array: {"Key": ["Value"]}
   // Value detection: true/false -> bool, digits -> uint, else -> string
   uint8_t cbor[128];
   int cpos = 0;
@@ -737,7 +832,9 @@ void cmdConfigSet(const String& args) {
   }
   for (int i = 0; i < keyLen; i++) cbor[cpos++] = key.charAt(i);
 
-  // Value
+  // Value wrapped in array(1)
+  cbor[cpos++] = 0x81;  // array of 1 element
+
   if (value == "true") {
     cbor[cpos++] = 0xF5;
   } else if (value == "false") {
