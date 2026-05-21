@@ -75,7 +75,21 @@ context, `?` = unknown.
 | `00010008` | Move down (lift) | *** | 16-bit LE step (1-500) |
 | `00010009` | Move up (lift) | *** | 16-bit LE step (1-500) |
 | `0001000a` | Tilt limit? | * | Reads `0x01` on venetian motors |
-| `0001000b` | Configure range | ** | `0x0000`=Start, `0x0001`=Full, `0x0002`=Half |
+| `0001000b` | Configure range | ** | `00 00`=Start, `00 01`=Full, `00 02`=Half |
+
+TaHoma Pro also uses a longer up/down payload for dimension-aware movement:
+
+```
+duration_le_u16 + release + dimension + speed_mode
+```
+
+Known values from the APK:
+
+- `dimension`: `0` = main/lift, `1` = secondary/tilt, `2` = main+secondary
+- `speed_mode`: `2` = nominal, `4` = quiet, `5` = high speed
+- `release`: app default is `0`; explicit dimension+mode release appears to be `2`
+
+The CLI's `tilt-up` / `tilt-down` commands use secondary dimension (`dimension=1`).
 
 #### Service 00020000 -- Network / Zigbee
 
@@ -100,6 +114,17 @@ characteristic `00040001`. Files are encoded in CBOR (Concise Binary Object
 Representation). Each value is stored as `[current_value, metadata]` where metadata
 includes writability, valid ranges, units, and enum options.
 
+The file protocol was checked against the TaHoma Pro APK and against observed motor
+behavior. The important practical details are:
+
+- File IDs are little-endian on the wire: `0x00C4` is sent as `C4 00`.
+- `OPEN_FILE` includes file ID and mode: `00 C4 00 00` for read, `00 C4 00 01` for write.
+- Reads from this motor currently work reliably with `READ + file ID`: `03 C4 00`.
+- Writes follow TaHoma Pro behavior: `WRITE` is `02` followed by CBOR only, no file ID.
+- Close works with file ID in the CLI flow: `04 C4 00`.
+- Written values must be wrapped in a one-element array, e.g. `{"Application": ["Venetian"]}`.
+- The tool runs config reads as delayed queued BLE operations because the motor needs human-scale spacing between file commands.
+
 | File ID | Name | Contents |
 |---------|------|----------|
 | `0x00C4` | **motor** | Application type, LiftRange, ReversedDirection, NominalSpeed, ramps, intermediate positions |
@@ -110,6 +135,9 @@ includes writability, valid ranges, units, and enum options.
 The `Application` field in the motor config is particularly important: it controls
 whether the motor operates as `"Roller"`, `"Venetian"`, `"Sheer"`, or `"Zebra"`.
 A venetian motor with Application set to "Roller" will have tilt disabled.
+
+Changing `Application` can reset range fields. After switching to `"Venetian"`, expect
+`LiftRange` and `TiltRange` to become `null` until the motor is recalibrated.
 
 ## Hardware
 
@@ -205,6 +233,10 @@ info                    Read device info: name, manufacturer, firmware, battery,
 ```
 up [step]               Move up (step: 1-500, default 100)
 down [step]             Move down (step: 1-500, default 100)
+tilt-up [step]          Jog secondary/tilt dimension up (default 50)
+tilt-down [step]        Jog secondary/tilt dimension down (default 50)
+orient <0-100>          Go to slat orientation percentage
+tilt-read               Read raw slat orientation characteristic
 stop                    Stop motor movement
 goto <pos>              Go to position (0 = fully open, 32767 = fully closed)
 open                    Full open (venetian blinds, not on all motors)
@@ -260,6 +292,20 @@ somfy> config set motor Application Venetian
 somfy> yes-config-write
   [OK] Config written! Power-cycle the motor for changes to take effect.
 ```
+
+After changing a roller-configured venetian motor, a later read should look more like:
+
+```
+somfy> config read motor
+  │ Application: "Venetian" (writable)
+  │        enum: Roller, Venetian, Zebra, Sheer
+  │ LiftRange: null (writable, 480-48000 pulse)
+  │ TiltRange: null (writable, 120-480 pulse)
+  │ ReversedDirection: false (writable)
+```
+
+The `null` ranges mean the motor must be recalibrated before Zigbee movement commands
+will work again.
 
 ### Raw BLE Access
 
@@ -346,6 +392,54 @@ somfy> yes-config-write
   (power-cycle the motor after this)
 ```
 
+After the power-cycle, read the config again. If `LiftRange` and `TiltRange` are `null`,
+recalibrate lift using:
+
+```
+somfy> range start
+somfy> down 100
+  (repeat until lower limit, use smaller steps near the end)
+somfy> limit down
+somfy> up 100
+  (repeat until upper limit)
+somfy> limit up
+```
+
+Then try to populate `TiltRange` using the app-derived secondary-dimension commands:
+
+```
+somfy> range start
+somfy> tilt-down 50
+  (repeat until one tilt end is reached; use smaller steps near the end)
+somfy> tilt-up 50
+  (repeat until the opposite tilt end is reached)
+somfy> range full
+somfy> config read motor
+  (check whether TiltRange is now populated)
+```
+
+If `tilt-up` / `tilt-down` do not move the slats, use raw writes to try explicit
+dimension+mode release (`release=2`, `dimension=1`, `mode=2`):
+
+```
+somfy> write 00010008 32 00 02 01 02  # secondary down, step 50
+somfy> write 00010009 32 00 02 01 02  # secondary up, step 50
+```
+
+Once `TiltRange` is populated, test direct orientation:
+
+```
+somfy> orient 0
+somfy> orient 100
+```
+
+Then test from zigbee2mqtt using the `_1` endpoint values exposed by Somfy devices:
+
+```bash
+mosquitto_pub -t 'zigbee2mqtt/DEVICE/set' -m '{"state_1": "OPEN"}'
+mosquitto_pub -t 'zigbee2mqtt/DEVICE/set' -m '{"tilt_1": 50}'
+```
+
 ### Factory reset and re-pair to zigbee2mqtt
 
 If the motor is in a completely broken state and you want to start fresh:
@@ -403,8 +497,8 @@ somfy> info
   │ Network (Zigbee):
   │   Channel:     11
   │   PAN ID:      0x1A62
-  │   EUI64:       4CC206FF:FE702CA3
-  │   BLE MAC:     4C:C2:06:70:2C:A3 (derived, removing FFFE)
+  │   EUI64:       4CC206FF:FEAABBCC
+  │   BLE MAC:     4C:C2:06:AA:BB:CC (derived, removing FFFE)
   └──────────────────────────────────────────
 ```
 

@@ -23,8 +23,8 @@ static BLEUUID UUID_IDENTIFY    ("00000001-cad9-46c6-a2ea-2ca16d57b4a5"); // ★
 static BLEUUID UUID_GOTO_POS    ("00000005-cad9-46c6-a2ea-2ca16d57b4a5"); // ★★★ lift goto
 static BLEUUID UUID_STOP        ("00000006-cad9-46c6-a2ea-2ca16d57b4a5"); // ★★★
 // 00000007 - ? tilt position/state? (reads 1 byte on venetian)            ★
-// 00000008 - ? tilt open? (write-only on venetian)                        ★
-// 00000009 - ? tilt close? (write-only on venetian)                       ★
+static BLEUUID UUID_ORIENTATION ("00000008-cad9-46c6-a2ea-2ca16d57b4a5"); // ★★ go-to slat orientation (0-100%)
+static BLEUUID UUID_TILT_POS    ("00000009-cad9-46c6-a2ea-2ca16d57b4a5"); // ★★ read slat orientation/tilt position
 static BLEUUID UUID_DELIVERY    ("0000000a-cad9-46c6-a2ea-2ca16d57b4a5"); // ★★
 static BLEUUID UUID_AUTH        ("0000000b-cad9-46c6-a2ea-2ca16d57b4a5"); // ★★★
 // 0000000d - open (venetian only, not present on all motors)              ★★
@@ -152,6 +152,10 @@ void printHelp() {
   Serial.println("│ MOVEMENT");
   Serial.println("│   up [step]           Move up (1-500, default 100)  ★★★");
   Serial.println("│   down [step]         Move down (1-500, default 100)★★★");
+  Serial.println("│   tilt-up [step]      Jog secondary/tilt up         ★");
+  Serial.println("│   tilt-down [step]    Jog secondary/tilt down       ★");
+  Serial.println("│   orient <0-100>      Go to slat orientation        ★★");
+  Serial.println("│   tilt-read           Read slat orientation char    ★★");
   Serial.println("│   stop                Stop movement                 ★★★");
   Serial.println("│   goto <pos>          Go to position (0-32767)      ★★");
   Serial.println("│   open                Full open (venetian?)         ★★");
@@ -1313,6 +1317,32 @@ void cmdMoveDown(int step) {
   if (bleWriteFlexible(UUID_MOVE_DOWN, data, 2)) printOK("Move down sent");
 }
 
+void cmdMoveDimension(bool up, int step, uint8_t dimension, uint8_t releaseMode = 0x00) {
+  // TaHoma Pro's dimensioned move payload is:
+  //   duration_le_u16 + release + dimension + speed_mode
+  // dimension: 0=main/lift, 1=secondary/tilt, 2=main+secondary
+  // speed_mode: 2=nominal, 4=quiet, 5=very high speed
+  if (step < 1) step = 1;
+  if (step > 500) step = 500;
+  uint8_t data[5] = {
+    (uint8_t)(step & 0xFF),
+    (uint8_t)((step >> 8) & 0xFF),
+    releaseMode,
+    dimension,
+    0x02
+  };
+  char msg[64];
+  snprintf(msg, sizeof(msg), "Moving %s dimension %u (step=%d)", up ? "UP" : "DOWN", dimension, step);
+  printInfo(msg);
+  if (bleWriteFlexible(up ? UUID_MOVE_UP : UUID_MOVE_DOWN, data, 5)) printOK("Dimensioned move sent");
+}
+
+void cmdTiltMove(bool up, int step) {
+  // Secondary dimension is what TaHoma uses for tilt-oriented adjustment.
+  // release=0 is app default; if ignored, raw-write 01 00 02 01 02 can be tested.
+  cmdMoveDimension(up, step, 0x01, 0x00);
+}
+
 void cmdStop() {
   uint8_t val = 0x01;
   if (bleWriteFlexible(UUID_STOP, &val, 1)) printOK("Stop sent");
@@ -1327,11 +1357,31 @@ void cmdGoto(int pos) {
   if (bleWriteFlexible(UUID_GOTO_POS, data, 2)) printOK("Goto position sent");
 }
 
+void cmdOrient(int pct) {
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  uint16_t val = (uint32_t)pct * 32767 / 100;
+  uint8_t data[2] = { (uint8_t)(val & 0xFF), (uint8_t)((val >> 8) & 0xFF) };
+  char msg[48]; snprintf(msg, sizeof(msg), "Going to orientation %d%%", pct);
+  printInfo(msg);
+  if (bleWriteFlexible(UUID_ORIENTATION, data, 2)) printOK("Orientation command sent");
+}
+
+void cmdTiltRead() {
+  uint8_t buf[8];
+  int len = bleReadTo(UUID_TILT_POS, buf, sizeof(buf));
+  Serial.print("  [OK] tilt pos raw (");
+  Serial.print(len);
+  Serial.print(" bytes): ");
+  printHex(buf, len);
+  Serial.println();
+}
+
 void cmdConfigRange(const String& mode) {
   uint8_t data[2] = {0, 0};
   if (mode == "start")     { data[0] = 0x00; }
-  else if (mode == "half") { data[0] = 0x02; }
-  else if (mode == "full") { data[0] = 0x01; }
+  else if (mode == "half") { data[0] = 0x00; data[1] = 0x02; }
+  else if (mode == "full") { data[0] = 0x00; data[1] = 0x01; }
   else { printERR("Usage: range start|half|full"); return; }
   char msg[48]; snprintf(msg, sizeof(msg), "Configure range: %s", mode.c_str());
   printInfo(msg);
@@ -1649,6 +1699,13 @@ void processCommand(String input) {
   else if (cmd == "info") { cmdInfo(); }
   else if (cmd == "up") { cmdMoveUp(arg.length() > 0 ? arg.toInt() : 100); }
   else if (cmd == "down") { cmdMoveDown(arg.length() > 0 ? arg.toInt() : 100); }
+  else if (cmd == "tilt-up" || cmd == "tup") { cmdTiltMove(true, arg.length() > 0 ? arg.toInt() : 50); }
+  else if (cmd == "tilt-down" || cmd == "tdown") { cmdTiltMove(false, arg.length() > 0 ? arg.toInt() : 50); }
+  else if (cmd == "orient") {
+    if (arg.length() == 0) { printERR("Usage: orient <0-100>"); return; }
+    cmdOrient(arg.toInt());
+  }
+  else if (cmd == "tilt-read") { cmdTiltRead(); }
   else if (cmd == "stop" || cmd == "s") { cmdStop(); }
   else if (cmd == "open") { uint8_t v=0x01; if(bleWriteFlexible(BLEUUID("0000000d-cad9-46c6-a2ea-2ca16d57b4a5"),&v,1)) printOK("Open sent"); }
   else if (cmd == "close") { uint8_t v=0x01; if(bleWriteFlexible(BLEUUID("0000000e-cad9-46c6-a2ea-2ca16d57b4a5"),&v,1)) printOK("Close sent"); }
@@ -1717,10 +1774,12 @@ void processCommand(String input) {
     Serial.println("  │    If 'Roller', set to 'Venetian' for tilt:");
     Serial.println("  │    config set motor Application Venetian");
     Serial.println("  │ 4. range start      - Begin calibration");
-    Serial.println("  │ 5. down 100 (repeat) -> limit down");
-    Serial.println("  │ 6. up 100 (repeat)   -> limit up");
-    Serial.println("  │ 7. dir cw/ccw       - Fix direction");
-    Serial.println("  │ Motor should now be operational.");
+    Serial.println("  │ 5. down/up + limits - Set lift travel");
+    Serial.println("  │ 6. tilt-down/up     - Jog secondary/tilt travel");
+    Serial.println("  │ 7. range full       - Save full lift+tilt range");
+    Serial.println("  │ 8. config read motor - Verify LiftRange/TiltRange");
+    Serial.println("  │ 9. dir cw/ccw       - Fix direction if needed");
+    Serial.println("  │ Then test: orient 0 / orient 100 and Zigbee tilt_1.");
     Serial.println("  └─────────────────────────────────────────────");
   }
   else {
