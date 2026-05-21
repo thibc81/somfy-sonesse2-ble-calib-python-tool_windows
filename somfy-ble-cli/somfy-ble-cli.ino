@@ -1275,6 +1275,87 @@ void cmdRead(const String& args) {
 
 String inputBuffer = "";
 
+// ─── Command History ─────────────────────────────────────────────
+#define HISTORY_SIZE 16
+#define MAX_CMD_LEN 128
+char history[HISTORY_SIZE][MAX_CMD_LEN];
+int historyCount = 0;    // total commands stored
+int historyPos = -1;     // current browse position (-1 = typing new)
+String savedInput = "";  // saved input when browsing history
+
+void historyAdd(const String& cmd) {
+  if (cmd.length() == 0) return;
+  // Don't add duplicates of the last entry
+  if (historyCount > 0) {
+    int lastIdx = (historyCount - 1) % HISTORY_SIZE;
+    if (strcmp(history[lastIdx], cmd.c_str()) == 0) return;
+  }
+  int idx = historyCount % HISTORY_SIZE;
+  cmd.toCharArray(history[idx], MAX_CMD_LEN);
+  historyCount++;
+}
+
+// Clear current line and redraw with new content
+void lineReplace(const String& newContent) {
+  // Erase current input from display
+  for (unsigned int i = 0; i < inputBuffer.length(); i++) Serial.print("\b \b");
+  inputBuffer = newContent;
+  Serial.print(inputBuffer);
+}
+
+void historyUp() {
+  if (historyCount == 0) return;
+  int available = historyCount < HISTORY_SIZE ? historyCount : HISTORY_SIZE;
+  if (historyPos == -1) {
+    // First press: save current input, go to most recent
+    savedInput = inputBuffer;
+    historyPos = historyCount - 1;
+  } else if (historyPos > historyCount - available) {
+    historyPos--;
+  } else {
+    return; // at oldest
+  }
+  lineReplace(String(history[historyPos % HISTORY_SIZE]));
+}
+
+void historyDown() {
+  if (historyPos == -1) return;
+  if (historyPos < historyCount - 1) {
+    historyPos++;
+    lineReplace(String(history[historyPos % HISTORY_SIZE]));
+  } else {
+    // Back to the input being typed
+    historyPos = -1;
+    lineReplace(savedInput);
+  }
+}
+
+// ─── Escape Sequence Parser ──────────────────────────────────────
+// Handles VT100 arrow keys: ESC [ A (up), ESC [ B (down)
+enum EscState { ESC_NONE, ESC_GOT_ESC, ESC_GOT_BRACKET };
+EscState escState = ESC_NONE;
+
+// Returns true if the character was consumed by the escape parser
+bool handleEscape(char c) {
+  switch (escState) {
+    case ESC_NONE:
+      if (c == 27) { escState = ESC_GOT_ESC; return true; }
+      return false;
+    case ESC_GOT_ESC:
+      if (c == '[') { escState = ESC_GOT_BRACKET; return true; }
+      escState = ESC_NONE;
+      return false;  // wasn't an escape sequence, let it through
+    case ESC_GOT_BRACKET:
+      escState = ESC_NONE;
+      if (c == 'A') { historyUp(); return true; }    // Up arrow
+      if (c == 'B') { historyDown(); return true; }   // Down arrow
+      if (c == 'C') { return true; }                  // Right arrow (ignore)
+      if (c == 'D') { return true; }                  // Left arrow (ignore)
+      return true;  // consume unknown sequence chars
+  }
+  return false;
+}
+
 void processCommand(String input) {
   input.trim();
   if (input.length() == 0) return;
@@ -1478,17 +1559,34 @@ void setup() {
 void loop() {
   while (Serial.available()) {
     char c = Serial.read();
+
+    // Handle escape sequences (arrow keys)
+    if (handleEscape(c)) continue;
+
     if (c == '\n' || c == '\r') {
+      Serial.println();
       if (inputBuffer.length() > 0) {
-        Serial.println();
+        historyAdd(inputBuffer);
         processCommand(inputBuffer);
         inputBuffer = "";
-        Serial.print("somfy> ");
+        historyPos = -1;
+        savedInput = "";
       }
+      Serial.print("somfy> ");
     } else if (c == 127 || c == 8) {
+      // Backspace
       if (inputBuffer.length() > 0) {
         inputBuffer.remove(inputBuffer.length() - 1);
         Serial.print("\b \b");
+      }
+    } else if (c == 0x15) {
+      // Ctrl-U: clear line
+      for (unsigned int i = 0; i < inputBuffer.length(); i++) Serial.print("\b \b");
+      inputBuffer = "";
+    } else if (c == 0x01) {
+      // Ctrl-A: repeat last command
+      if (historyCount > 0) {
+        lineReplace(String(history[(historyCount - 1) % HISTORY_SIZE]));
       }
     } else if (c >= 32 && c < 127) {
       inputBuffer += c;

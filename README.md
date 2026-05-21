@@ -5,8 +5,8 @@ ESP32-based BLE tool for configuring and recovering **Somfy Sonesse2 Zigbee** mo
 app.
 
 Exposes an interactive serial CLI over USB that lets you authenticate, calibrate limits,
-control movement, and factory-reset the motor -- all through the motor's Bluetooth Low
-Energy (BLE) GATT interface.
+control movement, read/write internal config files, and factory-reset the motor -- all
+through the motor's Bluetooth Low Energy (BLE) GATT interface.
 
 ## Why does this exist?
 
@@ -20,6 +20,10 @@ firmware glitch, or accidental reset), it enters a state where:
 - `configStatus` reports bit 0 = 0 (**not operational**)
 - Position/limit attributes return `UNSUPPORTED_ATTRIBUTE` or `CALIBRATION_ERROR`
 - **All movement commands are silently ignored**
+
+Additionally, **Venetian blind motors may ship with Application type set to "Roller"**
+in their internal config, which disables tilt functionality entirely. This can only be
+changed through the BLE config file interface.
 
 The official recovery paths all require hardware or accounts most users don't have:
 
@@ -42,22 +46,70 @@ by decompiling the TaHoma Pro Android APK. All characteristics share the base UU
 
 ### Known Characteristics
 
-| UUID Prefix | Function | Parameters |
-|-------------|----------|------------|
-| `0000000b` | **Authentication** | PIN as 3-byte little-endian int |
-| `00000001` | Identify (jog) | `0x01` |
-| `00000005` | Go to position | 16-bit LE, 0=open, 32767=closed |
-| `00000006` | Stop | `0x01` |
-| `0000000a` | Delivery mode | `0x01` (motor off until button press) |
-| `0000000d` | Open (venetian) | `0x01` |
-| `0000000e` | Close (venetian) | `0x01` |
-| `00010001` | **Factory reset** | `0x01` |
-| `00010005` | Set direction | `0x00`=CCW, `0x01`=CW |
-| `00010007` | Set limit | `0x00`=upper, `0x01`=lower |
-| `00010008` | Move down | 16-bit LE step (1-500) |
-| `00010009` | Move up | 16-bit LE step (1-500) |
-| `0001000b` | Configure range | `0x0000`=Start, `0x0001`=Full, `0x0002`=Half |
-| `00020001` | **Leave Zigbee network** | `0x01` (rejoin) |
+Confidence: `***` = tested, `**` = confirmed by reverse engineering, `*` = guessed from
+context, `?` = unknown.
+
+#### Service 00000000 -- Operational
+
+| UUID Prefix | Function | Confidence | Parameters |
+|-------------|----------|:----------:|------------|
+| `0000000b` | **Authentication** | *** | PIN as 3-byte little-endian int |
+| `00000001` | Identify (jog) | *** | `0x01` |
+| `00000005` | Go to position (lift) | *** | 16-bit LE, 0=open, 32767=closed |
+| `00000006` | Stop | *** | `0x01` |
+| `00000007` | Tilt position/state? | * | Reads 1 byte on venetian motors |
+| `00000008` | Tilt open? | * | Write-only on venetian motors |
+| `00000009` | Tilt close? | * | Write-only on venetian motors |
+| `0000000a` | Delivery mode | ** | `0x01` (motor off until button press) |
+| `0000000d` | Open (venetian) | ** | `0x01` -- not present on all motors |
+| `0000000e` | Close (venetian) | ** | `0x01` -- not present on all motors |
+
+#### Service 00010000 -- Configuration
+
+| UUID Prefix | Function | Confidence | Parameters |
+|-------------|----------|:----------:|------------|
+| `00010001` | **Factory reset** | ** | `0x01` |
+| `00010002` | Firmware version | ** | Reads ASCII string |
+| `00010005` | Set direction | ** | `0x00`=CCW, `0x01`=CW |
+| `00010007` | Set limit (lift) | ** | `0x00`=upper, `0x01`=lower |
+| `00010008` | Move down (lift) | *** | 16-bit LE step (1-500) |
+| `00010009` | Move up (lift) | *** | 16-bit LE step (1-500) |
+| `0001000a` | Tilt limit? | * | Reads `0x01` on venetian motors |
+| `0001000b` | Configure range | ** | `0x0000`=Start, `0x0001`=Full, `0x0002`=Half |
+
+#### Service 00020000 -- Network / Zigbee
+
+| UUID Prefix | Function | Confidence | Notes |
+|-------------|----------|:----------:|-------|
+| `00020001` | **Leave Zigbee network** | *** | `0x01` -- triggers rejoin |
+| `00020002` | Zigbee channel | ** | Reads 1 byte |
+| `00020003` | PAN ID / network addr | * | Reads 2 bytes LE |
+| `00020005` | Zigbee EUI64 | ** | Reads 8 bytes, little-endian |
+| `00020006` | Install code | * | Reads 18 bytes |
+
+#### Service 00040000 -- Config Files (WriteData/CBOR)
+
+| UUID Prefix | Function | Confidence | Notes |
+|-------------|----------|:----------:|-------|
+| `00040001` | Config file R/W | ** | CBOR protocol for motor config |
+
+### Config Files (CBOR Protocol)
+
+The motor stores configuration in files accessible through a binary protocol on
+characteristic `00040001`. Files are encoded in CBOR (Concise Binary Object
+Representation). Each value is stored as `[current_value, metadata]` where metadata
+includes writability, valid ranges, units, and enum options.
+
+| File ID | Name | Contents |
+|---------|------|----------|
+| `0x00C4` | **motor** | Application type, LiftRange, ReversedDirection, NominalSpeed, ramps, intermediate positions |
+| `0x00C3` | **radio** | DeviceName, EndProduct, ZigbeeTxPower, BleTxPower, StepLiftConversion, StepTiltConversion |
+| `0x00D2` | **type** | Firmware versions, hardware info, motor model (read-only) |
+| `0x00C2` | **hmi** | HMI config (often empty) |
+
+The `Application` field in the motor config is particularly important: it controls
+whether the motor operates as `"Roller"`, `"Venetian"`, `"Sheer"`, or `"Zebra"`.
+A venetian motor with Application set to "Roller" will have tilt disabled.
 
 ## Hardware
 
@@ -123,6 +175,9 @@ BLE:    4C:C2:06:AA:BB:CC
 
 ## CLI Reference
 
+The CLI supports command history (arrow up/down), backspace editing, Ctrl-U to clear
+the line, and Ctrl-A to recall the last command.
+
 ### Setup Commands
 
 ```
@@ -132,14 +187,17 @@ pin <code>              Set PIN code (from motor label)
 connect                 Connect to target motor via BLE
 disconnect              Disconnect
 auth                    Authenticate with PIN (required before any control)
-status                  Show current connection status
+status                  Show connection status
 ```
 
 ### Diagnostics
 
 ```
 identify                Make the motor jog (brief up/down) to identify itself
-services                List all BLE services and characteristics (labels known ones)
+services                List all BLE services with annotated characteristics
+                        (shows confidence levels and labels for known UUIDs)
+info                    Read device info: name, manufacturer, firmware, battery,
+                        Zigbee channel, PAN ID, EUI64, install code
 ```
 
 ### Movement
@@ -147,10 +205,10 @@ services                List all BLE services and characteristics (labels known 
 ```
 up [step]               Move up (step: 1-500, default 100)
 down [step]             Move down (step: 1-500, default 100)
-open                    Full open (venetian blinds)
-close                   Full close (venetian blinds)
 stop                    Stop motor movement
 goto <pos>              Go to position (0 = fully open, 32767 = fully closed)
+open                    Full open (venetian blinds, not on all motors)
+close                   Full close (venetian blinds, not on all motors)
 ```
 
 ### Calibration
@@ -163,6 +221,62 @@ limit up                Set current position as UPPER end limit
 limit down              Set current position as LOWER end limit
 dir cw                  Set motor direction to clockwise
 dir ccw                 Set motor direction to counter-clockwise
+```
+
+### Config Files
+
+Read and write the motor's internal CBOR configuration files.
+
+```
+config list             Show available config files with descriptions
+config read <file>      Read and decode a config file (pretty-printed CBOR)
+config dump <file>      Raw hex dump of a config file (for backup)
+config set <file> <key> <value>
+                        Set a field in a config file (with confirmation)
+                        Requires typing 'yes-config-write' to confirm
+
+Files: motor, radio, type, hmi
+```
+
+Example:
+
+```
+somfy> config read motor
+  [OK] Got 245 bytes, decoding CBOR:
+  ┌─────────────────────────────────────────────
+  │ Application: "Roller" (writable)
+  │        enum: Roller, Venetian, Zebra, Sheer
+  │ LiftRange: 4635 (writable, 480-48000 pulse)
+  │ ReversedDirection: false (writable)
+  │ IntermediatePositionsLift: [16 items]
+  └─────────────────────────────────────────────
+
+somfy> config set motor Application Venetian
+  [..] Setting motor.Application = Venetian
+  [..] CBOR (21 bytes): A1 6B 41 70 70 6C 69 ...
+  [!] This writes to motor config via CBOR protocol.
+  [!] Type 'yes-config-write' to confirm.
+
+somfy> yes-config-write
+  [OK] Config written! Power-cycle the motor for changes to take effect.
+```
+
+### Raw BLE Access
+
+For exploring unknown characteristics or debugging.
+
+```
+read <prefix>           Read a characteristic by UUID prefix
+                        e.g.: read 00000007
+write <prefix> <hex>    Write raw bytes to a characteristic
+                        e.g.: write 00000007 01
+                        e.g.: write 0001000a 00 01
+```
+
+### Zigbee Helpers
+
+```
+calibration on|off      Show MQTT command for Zigbee calibration mode
 ```
 
 ### Danger Zone
@@ -218,6 +332,20 @@ somfy> dir cw
 After setting limits, the motor should become operational again and respond to Zigbee
 commands from zigbee2mqtt / Home Assistant / ZHA.
 
+### Fixing tilt on a Venetian motor
+
+If your Venetian motor has working lift (up/down) but tilt doesn't work, check the
+Application type:
+
+```
+somfy> config read motor
+  (look for Application: "Roller")
+
+somfy> config set motor Application Venetian
+somfy> yes-config-write
+  (power-cycle the motor after this)
+```
+
 ### Factory reset and re-pair to zigbee2mqtt
 
 If the motor is in a completely broken state and you want to start fresh:
@@ -262,6 +390,24 @@ somfy> yes-leave
 
 Enable permit-join on your coordinator. The motor should appear within seconds.
 
+### Inspecting motor details
+
+```
+somfy> info
+  ┌─ Device Information ───────────────────────
+  │ Device Name:   Sonesse2 40 Zigbee
+  │ HW Revision:   ...
+  │ Manufacturer:  Somfy
+  │ Battery:       100%
+  │
+  │ Network (Zigbee):
+  │   Channel:     11
+  │   PAN ID:      0x1A62
+  │   EUI64:       4CC206FF:FE702CA3
+  │   BLE MAC:     4C:C2:06:70:2C:A3 (derived, removing FFFE)
+  └──────────────────────────────────────────
+```
+
 ## Troubleshooting
 
 ### Motor doesn't show up in BLE scan
@@ -295,6 +441,13 @@ Enable permit-join on your coordinator. The motor should appear within seconds.
     -m '{"read":{"cluster":258,"attributes":[7]}}'
   ```
   Value should have bit 0 set (odd number = operational)
+
+### Tilt doesn't work on Venetian motor
+
+- Check `config read motor` -- if Application is "Roller", change it:
+  `config set motor Application Venetian` + `yes-config-write`
+- Power-cycle the motor after changing the Application type
+- Tilt may need separate limit calibration
 
 ## Zigbee Diagnostics (via zigbee2mqtt)
 
