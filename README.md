@@ -446,6 +446,10 @@ somfy> orient 0
 somfy> orient 100
 ```
 
+If BLE orientation works but Zigbee still does not, check whether the motor left the
+Zigbee network during the config/range changes. Enable permit-join and let it rejoin,
+then re-interview if zigbee2mqtt still exposes stale roller-only state.
+
 Then test from zigbee2mqtt using the `_1` endpoint values exposed by Somfy devices:
 
 ```bash
@@ -541,6 +545,8 @@ somfy> info
 ### Motor moves but Zigbee still shows non-operational
 
 - After setting limits via BLE, you may need to power-cycle the motor
+- After changing `Application` or completing range calibration, the motor may leave the
+  Zigbee network; enable permit-join and let it rejoin
 - Remove and re-pair the device in zigbee2mqtt if the state doesn't update
 - Read `configStatus` via MQTT to verify:
   ```bash
