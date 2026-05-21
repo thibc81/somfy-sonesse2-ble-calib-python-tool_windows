@@ -1,5 +1,6 @@
 # APK decompilation work
 apk-work/
+com.somfy.pro/
 *.apk
 *.xapk
 

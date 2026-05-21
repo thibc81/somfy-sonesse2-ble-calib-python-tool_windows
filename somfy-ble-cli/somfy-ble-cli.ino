@@ -1775,10 +1775,11 @@ void processCommand(String input) {
     Serial.println("  │    config set motor Application Venetian");
     Serial.println("  │ 4. range start      - Begin calibration");
     Serial.println("  │ 5. down/up + limits - Set lift travel");
-    Serial.println("  │ 6. tilt-down/up     - Jog secondary/tilt travel");
-    Serial.println("  │ 7. range full       - Save full lift+tilt range");
-    Serial.println("  │ 8. config read motor - Verify LiftRange/TiltRange");
-    Serial.println("  │ 9. dir cw/ccw       - Fix direction if needed");
+    Serial.println("  │ 6. range start      - Start tilt range capture");
+    Serial.println("  │ 7. tilt-down/up     - Jog secondary/tilt travel");
+    Serial.println("  │ 8. range full       - Stop/save full tilt range");
+    Serial.println("  │ 9. config read motor - Verify LiftRange/TiltRange");
+    Serial.println("  │10. dir cw/ccw       - Fix direction if needed");
     Serial.println("  │ Then test: orient 0 / orient 100 and Zigbee tilt_1.");
     Serial.println("  └─────────────────────────────────────────────");
   }

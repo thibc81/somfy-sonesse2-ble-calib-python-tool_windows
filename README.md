@@ -249,11 +249,15 @@ close                   Full close (venetian blinds, not on all motors)
 range start             Begin range configuration (required before setting limits)
 range half              Half range mode
 range full              Full range mode
-limit up                Set current position as UPPER end limit
-limit down              Set current position as LOWER end limit
+limit up                Set current lift position as UPPER end limit
+limit down              Set current lift position as LOWER end limit
 dir cw                  Set motor direction to clockwise
 dir ccw                 Set motor direction to counter-clockwise
 ```
+
+For Venetian tilt, the TaHoma Pro validation flow does **not** use `limit up/down`.
+It starts range capture with `range start`, moves the secondary/tilt dimension through
+its travel, then saves with `range full` (or `range half` for half-range variants).
 
 ### Config Files
 
@@ -417,6 +421,15 @@ somfy> range full
 somfy> config read motor
   (check whether TiltRange is now populated)
 ```
+
+This mirrors the app's validation action sequence:
+
+```
+SomfyConfigureRangeStart -> ConfigureRangeStart -> 0001000B: 00 00
+SomfyConfigureRange      -> ConfigureRangeFull  -> 0001000B: 00 01
+```
+
+For half-range variants, the final command is `range half` (`0001000B: 00 02`).
 
 If `tilt-up` / `tilt-down` do not move the slats, use raw writes to try explicit
 dimension+mode release (`release=2`, `dimension=1`, `mode=2`):
